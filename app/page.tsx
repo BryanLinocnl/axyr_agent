@@ -10,6 +10,7 @@ import { IDEMonacoEditor, type OpenFile, type EditorStatus } from "@/components/
 
 export default function Page() {
   const [chatWidth, setChatWidth] = useState(320)
+  const [rootPath, setRootPath] = useState<string>("")
   const [tabs, setTabs] = useState<EditorTab[]>([])
   const [activeTabId, setActiveTabId] = useState("")
   const [openFile, setOpenFile] = useState<OpenFile | undefined>(undefined)
@@ -121,7 +122,7 @@ export default function Page() {
         className="flex shrink-0 flex-col overflow-hidden border-r border-[#2d2d2d]"
         style={{ width: 240 }}
       >
-        <FileExplorer onFileOpen={handleFileOpen} />
+        <FileExplorer onFileOpen={handleFileOpen} onRootPathChange={setRootPath} />
       </aside>
 
       {/* Center panel — Monaco Editor */}
@@ -176,7 +177,7 @@ export default function Page() {
         className="flex shrink-0 flex-col overflow-hidden"
         style={{ width: chatWidth }}
       >
-        <AgentChat />
+        <AgentChat rootPath={rootPath} />
       </aside>
     </div>
   )

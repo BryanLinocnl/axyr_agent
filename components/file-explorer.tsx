@@ -17,6 +17,7 @@ import {
   FilePlus,
   Loader2,
   Copy,
+  Trash2,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
@@ -107,6 +108,7 @@ function TreeNode({
   onSelect,
   onFileOpen,
   onDuplicate,
+  onDelete,
   onCreateConfirm,
   onCreateCancel,
 }: {
@@ -117,6 +119,7 @@ function TreeNode({
   onSelect: (path: string, type: "file" | "folder") => void
   onFileOpen: (path: string) => void
   onDuplicate: (node: FileNode) => void
+  onDelete: (node: FileNode) => void
   onCreateConfirm: (name: string) => void
   onCreateCancel: () => void
 }) {
@@ -145,13 +148,22 @@ function TreeNode({
               : <Folder className="h-3.5 w-3.5 shrink-0 text-[#dcb67a]" />}
             <span className="truncate">{node.name}</span>
           </button>
-          <button
-            onClick={(e) => { e.stopPropagation(); onDuplicate(node) }}
-            className="mr-1 hidden h-4 w-4 items-center justify-center rounded text-[#666666] hover:text-[#cccccc] group-hover/item:flex"
-            title="Duplicar"
-          >
-            <Copy className="h-3 w-3" />
-          </button>
+          <div className="mr-1 hidden items-center gap-0.5 group-hover/item:flex">
+            <button
+              onClick={(e) => { e.stopPropagation(); onDuplicate(node) }}
+              className="h-4 w-4 flex items-center justify-center rounded text-[#666666] hover:text-[#cccccc]"
+              title="Duplicar"
+            >
+              <Copy className="h-3 w-3" />
+            </button>
+            <button
+              onClick={(e) => { e.stopPropagation(); onDelete(node) }}
+              className="h-4 w-4 flex items-center justify-center rounded text-[#666666] hover:text-red-400"
+              title="Excluir"
+            >
+              <Trash2 className="h-3 w-3" />
+            </button>
+          </div>
         </div>
         {open && (
           <div>
@@ -173,6 +185,7 @@ function TreeNode({
                 onSelect={onSelect}
                 onFileOpen={onFileOpen}
                 onDuplicate={onDuplicate}
+                onDelete={onDelete}
                 onCreateConfirm={onCreateConfirm}
                 onCreateCancel={onCreateCancel}
               />
@@ -198,13 +211,22 @@ function TreeNode({
         {getFileIcon(node.name)}
         <span className="truncate">{node.name}</span>
       </button>
-      <button
-        onClick={(e) => { e.stopPropagation(); onDuplicate(node) }}
-        className="mr-1 hidden h-4 w-4 items-center justify-center rounded text-[#666666] hover:text-[#cccccc] group-hover/item:flex"
-        title="Duplicar"
-      >
-        <Copy className="h-3 w-3" />
-      </button>
+      <div className="mr-1 hidden items-center gap-0.5 group-hover/item:flex">
+        <button
+          onClick={(e) => { e.stopPropagation(); onDuplicate(node) }}
+          className="h-4 w-4 flex items-center justify-center rounded text-[#666666] hover:text-[#cccccc]"
+          title="Duplicar"
+        >
+          <Copy className="h-3 w-3" />
+        </button>
+        <button
+          onClick={(e) => { e.stopPropagation(); onDelete(node) }}
+          className="h-4 w-4 flex items-center justify-center rounded text-[#666666] hover:text-red-400"
+          title="Excluir"
+        >
+          <Trash2 className="h-3 w-3" />
+        </button>
+      </div>
     </div>
   )
 }
@@ -233,8 +255,10 @@ async function readDirRecursive(dirPath: string): Promise<FileNode[]> {
 
 export function FileExplorer({
   onFileOpen,
+  onRootPathChange,
 }: {
   onFileOpen?: (file: OpenFile) => void
+  onRootPathChange?: (path: string) => void
 }) {
   const [rootPath, setRootPath] = useState<string | null>(null)
   const [rootName, setRootName] = useState<string>("")
@@ -243,6 +267,11 @@ export function FileExplorer({
   const [loading, setLoading] = useState(false)
   const [selectedPath, setSelectedPath] = useState<string | null>(null)
   const [pendingCreate, setPendingCreate] = useState<PendingCreate>(null)
+
+  useEffect(() => {
+    if (rootPath) onRootPathChange?.(rootPath)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rootPath])
 
   const refreshTree = useCallback(async (path: string) => {
     const nodes = await readDirRecursive(path)
@@ -375,6 +404,17 @@ export function FileExplorer({
     }
   }, [rootPath, refreshTree])
 
+  const handleDelete = useCallback(async (node: FileNode) => {
+    if (!rootPath) return
+    const { remove } = await import("@tauri-apps/plugin-fs")
+    try {
+      await remove(node.path, { recursive: true })
+      await refreshTree(rootPath)
+    } catch (e) {
+      console.error("delete failed:", e)
+    }
+  }, [rootPath, refreshTree])
+
   const startCreate = (type: "file" | "folder") => {
     const parent = getCreateParent()
     if (!parent) return
@@ -479,6 +519,7 @@ export function FileExplorer({
                   onSelect={handleSelect}
                   onFileOpen={handleFileOpen}
                   onDuplicate={handleDuplicate}
+                  onDelete={handleDelete}
                   onCreateConfirm={handleCreate}
                   onCreateCancel={() => setPendingCreate(null)}
                 />
