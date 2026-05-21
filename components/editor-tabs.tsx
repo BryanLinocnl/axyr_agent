@@ -77,7 +77,7 @@ export function EditorTabs({ tabs, activeId, onSelect, onClose }: Props) {
 
               <span className="truncate">
                 {tab.modified && (
-                  <span className="mr-0.5 text-[#e8d44d]">●</span>
+                  <span className="mr-0.5 text-orange-400">*</span>
                 )}
                 {tab.filename}
               </span>

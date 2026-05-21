@@ -2,23 +2,67 @@
 
 import { useCallback, useRef, useState } from "react"
 
+import { ActivityBar } from "@/components/activity-bar"
 import { AgentChat } from "@/components/agent-chat"
 import { EditorTabs, type EditorTab } from "@/components/editor-tabs"
 import { FileExplorer } from "@/components/file-explorer"
-import { IDEMonacoEditor } from "@/components/monaco-editor"
-
-const INITIAL_TABS: EditorTab[] = [
-  {
-    id: "1",
-    filename: "HelloWorld.tsx",
-    path: ["src", "components", "HelloWorld.tsx"],
-  },
-]
+import { IDEMonacoEditor, type OpenFile, type EditorStatus } from "@/components/monaco-editor"
 
 export default function Page() {
   const [chatWidth, setChatWidth] = useState(320)
-  const [tabs, setTabs] = useState<EditorTab[]>(INITIAL_TABS)
-  const [activeTabId, setActiveTabId] = useState("1")
+  const [tabs, setTabs] = useState<EditorTab[]>([])
+  const [activeTabId, setActiveTabId] = useState("")
+  const [openFile, setOpenFile] = useState<OpenFile | undefined>(undefined)
+  const [editorStatus, setEditorStatus] = useState<EditorStatus>({
+    line: 1, col: 1, totalLines: 0, totalChars: 0, language: "",
+  })
+  const openFileRef = useRef<OpenFile | undefined>(undefined)
+  const fileCacheRef = useRef<Map<string, string>>(new Map())
+
+  const handleFileOpen = useCallback((file: OpenFile) => {
+    const filename = file.path.split("/").pop() ?? file.path
+    fileCacheRef.current.set(file.path, file.content)
+    openFileRef.current = file
+    setOpenFile(file)
+    setTabs((prev) => {
+      const exists = prev.find((t) => t.id === file.path)
+      if (exists) {
+        setActiveTabId(file.path)
+        return prev
+      }
+      const newTab: EditorTab = {
+        id: file.path,
+        filename,
+        path: file.path.split("/"),
+      }
+      setActiveTabId(file.path)
+      return [...prev, newTab]
+    })
+  }, [])
+
+  const handleChange = useCallback((content: string) => {
+    const path = openFileRef.current?.path
+    if (!path) return
+    setTabs((prev) =>
+      prev.map((t) => (t.id === path ? { ...t, modified: true } : t)),
+    )
+  }, [])
+
+  const handleSave = useCallback(async (content: string) => {
+    const path = openFileRef.current?.path
+    if (!path) return
+    const w = window as unknown as { __TAURI_INTERNALS__?: unknown }
+    if (!w.__TAURI_INTERNALS__) return
+    try {
+      const { writeTextFile } = await import("@tauri-apps/plugin-fs")
+      await writeTextFile(path, content)
+      setTabs((prev) =>
+        prev.map((t) => (t.id === path ? { ...t, modified: false } : t)),
+      )
+    } catch (e) {
+      console.error("save failed:", e)
+    }
+  }, [])
 
   const dragging = useRef(false)
   const startX = useRef(0)
@@ -49,22 +93,35 @@ export default function Page() {
     [chatWidth],
   )
 
+  const selectTab = useCallback((id: string) => {
+    setActiveTabId(id)
+    const cached = fileCacheRef.current.get(id)
+    if (cached !== undefined) {
+      const file = { path: id, content: cached }
+      openFileRef.current = file
+      setOpenFile(file)
+    }
+  }, [])
+
   const closeTab = (id: string) => {
     const next = tabs.filter((t) => t.id !== id)
     setTabs(next)
     if (activeTabId === id && next.length > 0) {
-      setActiveTabId(next[next.length - 1].id)
+      selectTab(next[next.length - 1].id)
     }
   }
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-[#0d0d0d]">
+      {/* Activity Bar */}
+      <ActivityBar />
+
       {/* Left panel — File Explorer */}
       <aside
         className="flex shrink-0 flex-col overflow-hidden border-r border-[#2d2d2d]"
         style={{ width: 240 }}
       >
-        <FileExplorer />
+        <FileExplorer onFileOpen={handleFileOpen} />
       </aside>
 
       {/* Center panel — Monaco Editor */}
@@ -74,11 +131,16 @@ export default function Page() {
             <EditorTabs
               tabs={tabs}
               activeId={activeTabId}
-              onSelect={setActiveTabId}
+              onSelect={selectTab}
               onClose={closeTab}
             />
             <div className="flex-1 overflow-hidden">
-              <IDEMonacoEditor />
+              <IDEMonacoEditor
+                file={openFile}
+                onChange={handleChange}
+                onSave={handleSave}
+                onStatusChange={setEditorStatus}
+              />
             </div>
           </>
         ) : (
@@ -87,9 +149,19 @@ export default function Page() {
           </div>
         )}
         <div className="flex items-center gap-4 border-t border-[#2d2d2d] bg-[#007acc] px-3 py-0.5 text-[10px] text-white">
-          <span>TypeScript</span>
+          {editorStatus.language && (
+            <span className="capitalize">{editorStatus.language}</span>
+          )}
           <span>UTF-8</span>
-          <span className="ml-auto">Ln 1, Col 1</span>
+          {editorStatus.totalLines > 0 && (
+            <span>{editorStatus.totalLines} lines</span>
+          )}
+          {editorStatus.totalChars > 0 && (
+            <span>{editorStatus.totalChars.toLocaleString()} chars</span>
+          )}
+          <span className="ml-auto">
+            Ln {editorStatus.line}, Col {editorStatus.col}
+          </span>
         </div>
       </main>
 

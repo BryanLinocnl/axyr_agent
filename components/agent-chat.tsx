@@ -36,7 +36,9 @@ export function AgentChat() {
   const [isStreaming, setIsStreaming] = useState(false)
   const [showModelMenu, setShowModelMenu] = useState(false)
   const bottomRef = useRef<HTMLDivElement>(null)
+  const scrollRef = useRef<HTMLDivElement>(null)
   const abortRef = useRef<AbortController | null>(null)
+  const userScrolledUp = useRef(false)
 
   const hasInput = input.trim().length > 0
 
@@ -54,7 +56,12 @@ export function AgentChat() {
   }, [])
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" })
+    const el = scrollRef.current
+    if (!el) return
+    const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight
+    if (!userScrolledUp.current || distFromBottom < 80) {
+      bottomRef.current?.scrollIntoView({ behavior: "smooth" })
+    }
   }, [messages])
 
   const sendMessage = useCallback(async () => {
@@ -208,6 +215,12 @@ export function AgentChat() {
 
       {/* Messages */}
       <div
+        ref={scrollRef}
+        onScroll={() => {
+          const el = scrollRef.current
+          if (!el) return
+          userScrolledUp.current = el.scrollHeight - el.scrollTop - el.clientHeight > 80
+        }}
         className="flex-1 overflow-y-auto
           [&::-webkit-scrollbar]:w-[5px]
           [&::-webkit-scrollbar-track]:bg-transparent
