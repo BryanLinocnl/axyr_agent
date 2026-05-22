@@ -236,8 +236,10 @@ async function readDirRecursive(dirPath: string): Promise<FileNode[]> {
   const entries = await readDir(dirPath)
   const nodes: FileNode[] = []
 
+  const SKIP_DIRS = new Set(["node_modules", ".git", ".next", ".turbo", "dist", ".cache", "coverage"])
   for (const entry of entries) {
-    if (!entry.name || entry.name.startsWith(".")) continue
+    if (!entry.name) continue
+    if (entry.isDirectory && SKIP_DIRS.has(entry.name)) continue
     const entryPath = `${dirPath}/${entry.name}`
     if (entry.isDirectory) {
       const children = await readDirRecursive(entryPath)
@@ -256,9 +258,11 @@ async function readDirRecursive(dirPath: string): Promise<FileNode[]> {
 export function FileExplorer({
   onFileOpen,
   onRootPathChange,
+  refreshTrigger,
 }: {
   onFileOpen?: (file: OpenFile) => void
   onRootPathChange?: (path: string) => void
+  refreshTrigger?: number
 }) {
   const [rootPath, setRootPath] = useState<string | null>(null)
   const [rootName, setRootName] = useState<string>("")
@@ -277,6 +281,11 @@ export function FileExplorer({
     const nodes = await readDirRecursive(path)
     setTree(nodes)
   }, [])
+
+  useEffect(() => {
+    if (refreshTrigger && rootPath) refreshTree(rootPath)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshTrigger])
 
   useEffect(() => {
     const saved = localStorage.getItem("axyr:rootPath")

@@ -31,6 +31,10 @@ const SYSTEM_PROMPT = `You are AXYR, an autonomous development agent. You create
 
 ## MANDATORY RULES
 - Act immediately. NEVER explain what you are going to do before doing it.
+- NEVER ask for permission to run commands. NEVER ask "shall I proceed?", "can I execute?", "shall I continue?", "pode executar?", "can I run this?", or any similar confirmation. Just execute.
+- NEVER ask questions you can answer from context. NEVER ask about things the user already told you.
+- You CAN delete files. [DELETE] is a real command you have. NEVER say you cannot delete.
+- NEVER use [READ] or [LS] before [DELETE]. When asked to delete, DELETE immediately.
 - Use ONLY the commands below with the exact tags shown. ALWAYS close every tag.
 - ALL tags MUST be UPPERCASE. [write] is WRONG. [WRITE] is correct.
 - ALL file paths are ALWAYS relative to the project root directory shown below.
@@ -70,7 +74,28 @@ replacement text
 [LS][/LS]
 [LS]path/to/dir[/LS]
 
+NOTE: [READ] reads a single text FILE. NEVER use [READ] on a directory — use [LS] to list directory contents.
+
 [RUN]shell command here[/RUN]
+IMPORTANT: [RUN] has NO interactive stdin. If a command would prompt for any input, you MUST use [ASK] FIRST to collect that input from the user, then pipe it into the command.
+Example — shadcn needs a project name:
+[ASK]What is the project name?
+- my-app
+- dashboard-admin
+[/ASK]
+Then after the user answers (you receive it as "A: dashboard-admin"), run:
+[RUN]printf "dashboard-admin\n" | bunx --bun shadcn@latest init --preset abc --template next[/RUN]
+For yes/no prompts use --yes flag when available.
+
+[ASK]Your question here?
+- Option A
+- Option B
+- Option C
+[/ASK]
+[ASK] STRICT RULES:
+- ONLY use [ASK] when a command literally CANNOT run without specific input that the user hasn't provided (e.g., project name for an installer that prompts for it).
+- NEVER use [ASK] for: confirmations, "shall I proceed?", "can I run this?", "shall I continue?", anything you can infer from context, or anything the user already told you.
+- After the user answers, you will see [Collected answer — "question": "answer"] in your previous response. Use that answer IMMEDIATELY in [RUN] — do NOT generate [ASK] again for the same question, do NOT ask any new questions.
 
 ## WRITE RULES — CRITICAL
 - ALL file content MUST be inside [WRITE]...[/WRITE]. NEVER put content after [/WRITE].
@@ -135,6 +160,12 @@ type Message = {
   liveTokens?: number
 }
 
+function isAtLineStart(text: string, idx: number): boolean {
+  if (idx === 0) return true
+  const before = text.slice(0, idx).trimEnd()
+  return before.length === 0 || before[before.length - 1] === "\n"
+}
+
 function parseLiveCommands(text: string): LiveCommand[] {
   const items: Array<{ pos: number; cmd: LiveCommand }> = []
   for (const tag of COMMAND_TAGS) {
@@ -144,6 +175,10 @@ function parseLiveCommands(text: string): LiveCommand[] {
     while (true) {
       const openIdx = text.indexOf(openTag, idx)
       if (openIdx === -1) break
+      if (!INLINE_TAGS.has(tag) && !isAtLineStart(text, openIdx)) {
+        idx = openIdx + 1
+        continue
+      }
       const contentStart = openIdx + openTag.length
       const closeIdx = text.indexOf(closeTag, contentStart)
       const content = closeIdx === -1 ? text.slice(contentStart) : text.slice(contentStart, closeIdx)
@@ -155,14 +190,18 @@ function parseLiveCommands(text: string): LiveCommand[] {
   return items.sort((a, b) => a.pos - b.pos).map((i) => i.cmd)
 }
 
-const COMMAND_TAGS = ["MKDIR", "CD", "DELETE", "WRITE", "APPEND", "EDIT", "READ", "LS", "RUN"]
+const COMMAND_TAGS = ["MKDIR", "CD", "DELETE", "WRITE", "APPEND", "EDIT", "READ", "LS", "RUN", "ASK"]
 
 type ParsedCommand = { tag: string; arg: string; index: number }
+
+// Tags that can appear anywhere (not just line-start)
+const INLINE_TAGS = new Set(["ASK"])
 
 function parseCommands(text: string): ParsedCommand[] {
   const results: ParsedCommand[] = []
   for (const tag of COMMAND_TAGS) {
-    const regex = new RegExp(`\\[${tag}\\]([\\s\\S]*?)\\[\\/${tag}\\]`, "g")
+    const lineStart = INLINE_TAGS.has(tag) ? "" : `(?:^|\\n)[ \\t]*`
+    const regex = new RegExp(`${lineStart}\\[${tag}\\]([\\s\\S]*?)\\[\\/${tag}\\]`, "g")
     let match
     while ((match = regex.exec(text)) !== null) {
       results.push({ tag, arg: match[1], index: match.index })
@@ -172,13 +211,15 @@ function parseCommands(text: string): ParsedCommand[] {
 }
 
 function stripCommandBlocks(text: string): string {
-  const tagAlt = COMMAND_TAGS.join("|")
+  const lineStartTags = COMMAND_TAGS.filter((t) => !INLINE_TAGS.has(t)).join("|")
+  const inlineTags = [...INLINE_TAGS].join("|")
   return text
-    // Remove complete [TAG]...[/TAG] blocks
-    .replace(new RegExp(`\\[(${tagAlt})\\][\\s\\S]*?\\[\\/(${tagAlt})\\]`, "g"), "")
-    // Remove partial/unclosed blocks (from open tag to end of string)
-    .replace(new RegExp(`\\[(${tagAlt})\\][\\s\\S]*$`), "")
-    // Strip [resumo]/[/resumo] markers but keep content inside
+    // Remove line-start command blocks
+    .replace(new RegExp(`(?:^|\\n)[ \\t]*\\[(${lineStartTags})\\][\\s\\S]*?\\[\\/(${lineStartTags})\\]`, "g"), "")
+    // Remove partial/unclosed line-start blocks
+    .replace(new RegExp(`(?:^|\\n)[ \\t]*\\[(${lineStartTags})\\][\\s\\S]*$`), "")
+    // Remove inline command blocks (ASK etc) — anywhere in text
+    .replace(new RegExp(`\\[(${inlineTags})\\][\\s\\S]*?\\[\\/(${inlineTags})\\]`, "g"), "")
     .replace(/\[resumo\]/gi, "")
     .replace(/\[\/resumo\]/gi, "")
     .trim()
@@ -215,13 +256,17 @@ function extractThinking(text: string): { thinking: string; mainContent: string;
 function resolvePath(cwd: string, rel: string): string {
   const r = rel.trim()
   if (!r || r === ".") return cwd
-  const raw = r.startsWith("/") ? r : `${cwd.replace(/\/$/, "")}/${r}`
+  // Model sometimes omits leading "/" on absolute macOS paths (e.g. "Users/..." instead of "/Users/...")
+  const normalized = /^(Users|private|var|tmp|opt|Applications|System|Library)\//.test(r) ? "/" + r : r
+  const raw = normalized.startsWith("/") ? normalized : `${cwd.replace(/\/$/, "")}/${normalized}`
   return normalizePath(raw)
 }
 
 async function executeCommands(
   commands: ParsedCommand[],
   startCwd: string,
+  onConfirmDelete?: (path: string) => Promise<boolean>,
+  onAsk?: (question: string, options: string[]) => Promise<string>,
 ): Promise<{ results: CommandResult[]; finalCwd: string }> {
   const w = window as unknown as { __TAURI_INTERNALS__?: unknown }
   if (!w.__TAURI_INTERNALS__) {
@@ -231,7 +276,7 @@ async function executeCommands(
     }
   }
 
-  const { mkdir, writeTextFile, readTextFile, readDir, remove } =
+  const { mkdir, writeTextFile, readTextFile } =
     await import("@tauri-apps/plugin-fs")
 
   let cwd = startCwd
@@ -251,15 +296,32 @@ async function executeCommands(
           break
         }
         case "DELETE": {
-          await remove(resolvePath(cwd, cmd.arg), { recursive: true })
+          const delPath = resolvePath(cwd, cmd.arg)
+          if (onConfirmDelete) {
+            const confirmed = await onConfirmDelete(delPath)
+            if (!confirmed) {
+              results.push({ tag: cmd.tag, arg: cmd.arg.trim(), status: "ok", output: "Cancelled by user" })
+              break
+            }
+          }
+          const { invoke } = await import("@tauri-apps/api/core")
+          const delOut = await invoke<{ stdout: string; stderr: string; code: number }>(
+            "run_shell",
+            { command: `rm -rf "${delPath}"`, cwd },
+          )
+          if (delOut.code !== 0) throw new Error(delOut.stderr || "Delete failed")
           results.push({ tag: cmd.tag, arg: cmd.arg.trim(), status: "ok" })
           break
         }
         case "WRITE": {
           const lines = cmd.arg.split("\n")
-          const file = lines[0].trim()
+          // Skip blank leading lines (model sometimes puts newline right after [WRITE])
+          const firstNonEmpty = lines.findIndex((l) => l.trim() !== "")
+          const file = firstNonEmpty >= 0 ? lines[firstNonEmpty].trim() : ""
           if (!file) throw new Error("WRITE: missing filename on first line")
-          const contentStart = lines[1]?.trim() === "---" ? 2 : 1
+          if (/[\[\]]/.test(file)) throw new Error(`WRITE: invalid filename "${file}" (contains command tags)`)
+          if (/^\.?root$/i.test(file)) throw new Error(`WRITE: invalid filename "${file}" — use actual file path`)
+          const contentStart = firstNonEmpty + 1
           const content = lines.slice(contentStart).join("\n")
           const path = resolvePath(cwd, file)
           const dir = path.substring(0, path.lastIndexOf("/"))
@@ -310,27 +372,65 @@ async function executeCommands(
         }
         case "READ": {
           const path = resolvePath(cwd, cmd.arg)
-          const content = await readTextFile(path)
-          results.push({ tag: cmd.tag, arg: cmd.arg.trim(), status: "ok", output: content })
+          const { invoke } = await import("@tauri-apps/api/core")
+          const statOut = await invoke<{ stdout: string; stderr: string; code: number }>(
+            "run_shell",
+            { command: `test -d "${path}" && echo DIR || echo FILE`, cwd },
+          )
+          if (statOut.stdout.trim() === "DIR") {
+            const lsOut = await invoke<{ stdout: string; stderr: string; code: number }>(
+              "run_shell",
+              { command: `ls -la "${path}"`, cwd },
+            )
+            results.push({ tag: cmd.tag, arg: cmd.arg.trim(), status: "ok", output: `[Directory listing]\n${lsOut.stdout}` })
+          } else {
+            const content = await readTextFile(path)
+            results.push({ tag: cmd.tag, arg: cmd.arg.trim(), status: "ok", output: content })
+          }
           break
         }
         case "LS": {
-          const target = cmd.arg.trim()
-          const path = resolvePath(cwd, target || ".")
-          const entries = await readDir(path)
-          const output = entries
-            .map((e) => `${e.isDirectory ? "📁" : "📄"} ${e.name}`)
-            .join("\n")
-          results.push({ tag: cmd.tag, arg: target || ".", status: "ok", output })
+          const rawTarget = cmd.arg.trim().replace(/^\[|\]$/g, "")
+          const isRoot = !rawTarget || rawTarget === "." || rawTarget.toLowerCase() === "root"
+          const lsTarget = isRoot ? cwd : resolvePath(cwd, rawTarget)
+          const { invoke } = await import("@tauri-apps/api/core")
+          const lsOut = await invoke<{ stdout: string; stderr: string; code: number }>(
+            "run_shell",
+            { command: `ls -la "${lsTarget}"`, cwd },
+          )
+          if (lsOut.code !== 0) throw new Error(lsOut.stderr || "LS failed")
+          results.push({ tag: cmd.tag, arg: rawTarget || ".", status: "ok", output: lsOut.stdout })
           break
         }
         case "RUN": {
-          const command = cmd.arg.trim()
           const { invoke } = await import("@tauri-apps/api/core")
-          const out = await invoke<{ stdout: string; stderr: string; code: number }>(
-            "run_shell",
-            { command, cwd },
-          )
+          let command = cmd.arg.trim()
+          let finalOut: { stdout: string; stderr: string; code: number } | null = null
+          const collectedAnswers: string[] = []
+
+          // Detect interactive prompts, ask user, re-run with piped answers (max 2 attempts)
+          for (let attempt = 0; attempt < 2; attempt++) {
+            const runCmd = collectedAnswers.length > 0
+              ? `printf "${collectedAnswers.map((a) => a.replace(/"/g, '\\"')).join("\\n")}\\n" | ${command}`
+              : command
+            const out = await invoke<{ stdout: string; stderr: string; code: number }>(
+              "run_shell",
+              { command: runCmd, cwd },
+            )
+            finalOut = out
+            const combined = out.stdout + out.stderr
+            // Detect interactive prompt: lines like "? Some question?"
+            const promptMatch = combined.match(/\?\s+(.+?\?)\s*[›>]/m)
+            if (promptMatch && onAsk) {
+              const question = promptMatch[1].trim()
+              const answer = await onAsk(question, [])
+              collectedAnswers.push(answer)
+              continue
+            }
+            break
+          }
+
+          const out = finalOut!
           const output = [out.stdout, out.stderr ? `[stderr] ${out.stderr}` : ""]
             .filter(Boolean)
             .join("\n") || "(no output)"
@@ -342,10 +442,22 @@ async function executeCommands(
           })
           break
         }
+        case "ASK": {
+          if (onAsk) {
+            const lines = cmd.arg.split("\n").map((l) => l.trim()).filter(Boolean)
+            const question = lines[0] ?? "Question?"
+            const options = lines.slice(1)
+              .filter((l) => l.startsWith("-"))
+              .map((l) => l.replace(/^-\s*/, ""))
+            const answer = await onAsk(question, options)
+            results.push({ tag: cmd.tag, arg: question, status: "ok", output: answer })
+          }
+          break
+        }
       }
     } catch (e) {
       results.push({ tag: cmd.tag, arg: cmd.arg.trim(), status: "error", output: String(e) })
-      break
+      // continue to next command instead of stopping
     }
   }
 
@@ -355,7 +467,7 @@ async function executeCommands(
 const CMD_LABEL: Record<string, string> = {
   WRITE: "Write", APPEND: "Append", EDIT: "Edit",
   DELETE: "Delete", MKDIR: "Make dir", CD: "Change dir",
-  READ: "Read", LS: "List", RUN: "Run",
+  READ: "Read", LS: "List", RUN: "Run", ASK: "Ask",
 }
 
 function formatDuration(ms: number): string {
@@ -875,7 +987,7 @@ function SettingsModal({
   )
 }
 
-export function AgentChat({ rootPath }: { rootPath?: string }) {
+export function AgentChat({ rootPath, onCommandsExecuted }: { rootPath?: string; onCommandsExecuted?: () => void }) {
   const [input, setInput] = useState("")
   const [messages, setMessages] = useState<Message[]>([])
   const [models, setModels] = useState<string[]>([])
@@ -893,9 +1005,15 @@ export function AgentChat({ rootPath }: { rootPath?: string }) {
       return new Set(raw ? JSON.parse(raw) : [])
     } catch { return new Set() }
   })
+  const [pendingDelete, setPendingDelete] = useState<{ path: string; resolve: (v: boolean) => void } | null>(null)
+  const [pendingAsk, setPendingAsk] = useState<{ question: string; options: string[]; resolve: (v: string) => void } | null>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
   const abortRef = useRef<AbortController | null>(null)
+  const autoSendRef = useRef<string | null>(null)
+  const pendingContextRef = useRef<string | null>(null)
+  const answeredAsksRef = useRef<Map<string, string>>(new Map())
+  const freshlyAnsweredRef = useRef<Set<string>>(new Set())
   const historyRef = useRef<HTMLDivElement>(null)
   const clockBtnRef = useRef<HTMLButtonElement>(null)
   const [historyPos, setHistoryPos] = useState<{ top: number; right: number } | null>(null)
@@ -1049,6 +1167,10 @@ export function AgentChat({ rootPath }: { rootPath?: string }) {
     )
 
     try {
+      // Inject collected Q&A into last assistant message so model sees it already answered
+      const pendingContext = pendingContextRef.current
+      pendingContextRef.current = null
+
       const res = await fetch(`${OLLAMA_BASE}/api/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1057,11 +1179,19 @@ export function AgentChat({ rootPath }: { rootPath?: string }) {
           model: selectedModel,
           messages: [
             { role: "system", content: systemContent },
-            ...messages.map((m) => ({ role: m.role, content: m.content })),
+            ...messages.map((m, i) => {
+              const isLastAssistant = m.role === "assistant" && i === messages.length - 1
+              return {
+                role: m.role,
+                content: isLastAssistant && pendingContext
+                  ? m.content + `\n\n${pendingContext}`
+                  : m.content,
+              }
+            }),
             { role: "user", content: userContent },
           ],
           stream: true,
-          think: true,
+          ...((/qwen3|deepseek-r1|qwq/i).test(selectedModel) ? { think: true } : {}),
           keep_alive: "2m",
         }),
       })
@@ -1081,9 +1211,20 @@ export function AgentChat({ rootPath }: { rootPath?: string }) {
           if (!line.trim()) continue
           try {
             const parsed = JSON.parse(line)
+            // Surface Ollama errors (e.g. model not found, think: true on unsupported model)
+            if (parsed.error) {
+              fullResponse = `Error: ${parsed.error}`
+              setMessages((prev) =>
+                prev.map((m) => m.id === assistantId ? { ...m, content: fullResponse } : m),
+              )
+              break
+            }
             // Ollama thinking API: message.thinking field (newer versions, think: true)
             const thinkingDelta: string = parsed.message?.thinking ?? ""
             let contentDelta: string = parsed.message?.content ?? ""
+
+            const prevThinkingLen = fullThinking.length
+            const prevResponseLen = fullResponse.length
 
             if (thinkingDelta) fullThinking += thinkingDelta
 
@@ -1095,9 +1236,12 @@ export function AgentChat({ rootPath }: { rootPath?: string }) {
             }
 
             if (contentDelta) { fullResponse += contentDelta; liveTokenCount++ }
+
+            const thinkingChanged = fullThinking.length !== prevThinkingLen
+            const contentChanged = fullResponse.length !== prevResponseLen
             const thinkingDone = fullThinking.length > 0 && fullResponse.length > 0
 
-            if (thinkingDelta || contentDelta) {
+            if (thinkingChanged || contentChanged) {
               setMessages((prev) =>
                 prev.map((m) =>
                   m.id === assistantId
@@ -1109,16 +1253,6 @@ export function AgentChat({ rootPath }: { rootPath?: string }) {
                       liveCommands: parseLiveCommands(fullResponse),
                       liveTokens: liveTokenCount,
                     }
-                    : m,
-                ),
-              )
-            }
-            // Update thinking-only state (no content yet)
-            if (thinkingDelta && !contentDelta) {
-              setMessages((prev) =>
-                prev.map((m) =>
-                  m.id === assistantId
-                    ? { ...m, thinking: fullThinking, thinkingDone: false }
                     : m,
                 ),
               )
@@ -1142,23 +1276,68 @@ export function AgentChat({ rootPath }: { rootPath?: string }) {
         }
       }
 
-      const commands = parseCommands(fullResponse)
+      const rawCommands = parseCommands(fullResponse)
+      // Deduplicate: for each (tag, arg) pair keep only the last occurrence, cap at 30
+      const seen = new Map<string, number>()
+      rawCommands.forEach((c, i) => seen.set(`${c.tag}:${c.arg.trim()}`, i))
+      const commands = rawCommands.filter((c, i) => seen.get(`${c.tag}:${c.arg.trim()}`) === i).slice(0, 30)
       if (commands.length > 0) {
         setMessages((prev) =>
           prev.map((m) => (m.id === assistantId ? { ...m, executing: true } : m)),
         )
+        freshlyAnsweredRef.current = new Set()
         const { results, finalCwd } = await executeCommands(
           commands,
           rootPath || "",
+          (path) => new Promise((resolve) => setPendingDelete({ path, resolve })),
+          (question, options) => {
+            const cached = answeredAsksRef.current.get(question)
+            if (cached !== undefined) return Promise.resolve(cached)
+            return new Promise<string>((resolve) =>
+              setPendingAsk({
+                question,
+                options,
+                resolve: (answer) => {
+                  answeredAsksRef.current.set(question, answer)
+                  freshlyAnsweredRef.current.add(question)
+                  resolve(answer)
+                },
+              }),
+            )
+          },
         )
         setCurrentDir(finalCwd)
+        // Strip ANSI escape codes from command outputs
+        const cleanResults = results.map((r) => ({
+          ...r,
+          output: r.output
+            ?.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "")  // CSI sequences
+            .replace(/\x1b[()][AB012]/g, "")            // charset sequences
+            .replace(/\x1b[^[]/g, "")                   // other ESC sequences
+            .replace(/\x07/g, "")                        // BEL
+            .replace(/\r\n/g, "\n").replace(/\r/g, "\n") // normalize line endings
+            ?? r.output,
+        }))
         setMessages((prev) =>
           prev.map((m) =>
             m.id === assistantId
-              ? { ...m, executing: false, commandResults: results, stats: messageStats }
+              ? { ...m, executing: false, commandResults: cleanResults, stats: messageStats }
               : m,
           ),
         )
+        onCommandsExecuted?.()
+        // Auto-continue only for freshly-answered ASK questions (not cached repeats)
+        const freshAskResults = cleanResults.filter(
+          (r) => r.tag === "ASK" && r.status === "ok" && freshlyAnsweredRef.current.has(r.arg),
+        )
+        freshlyAnsweredRef.current = new Set()
+        if (freshAskResults.length > 0) {
+          const qaContext = freshAskResults
+            .map((r) => `[Collected answer — "${r.arg}": "${r.output}"]`)
+            .join(" ")
+          pendingContextRef.current = qaContext
+          autoSendRef.current = "DO NOT use [ASK]. Do NOT ask any questions. Execute [RUN] NOW with the collected answers above."
+        }
       } else {
         if (messageStats) {
           setMessages((prev) =>
@@ -1184,6 +1363,23 @@ export function AgentChat({ rootPath }: { rootPath?: string }) {
       abortRef.current = null
     }
   }, [hasInput, isStreaming, selectedModel, input, messages, rootPath, currentDir])
+
+  const [autoSendPending, setAutoSendPending] = useState(false)
+  useEffect(() => {
+    if (!isStreaming && autoSendRef.current) {
+      const msg = autoSendRef.current
+      autoSendRef.current = null
+      setInput(msg)
+      setAutoSendPending(true)
+    }
+  }, [isStreaming])
+  useEffect(() => {
+    if (autoSendPending && input && !isStreaming) {
+      setAutoSendPending(false)
+      sendMessage()
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoSendPending, input, isStreaming])
 
   function stopStreaming() {
     abortRef.current?.abort()
@@ -1215,6 +1411,10 @@ export function AgentChat({ rootPath }: { rootPath?: string }) {
     setInput("")
     setIsStreaming(false)
     setCurrentDir(rootPath || "")
+    autoSendRef.current = null
+    pendingContextRef.current = null
+    answeredAsksRef.current = new Map()
+    freshlyAnsweredRef.current = new Set()
   }
 
   async function restoreConversation(conv: Conversation) {
@@ -1231,6 +1431,10 @@ export function AgentChat({ rootPath }: { rootPath?: string }) {
     setIsStreaming(false)
     setCurrentDir(conv.rootPath || rootPath || "")
     setShowHistory(false)
+    autoSendRef.current = null
+    pendingContextRef.current = null
+    answeredAsksRef.current = new Map()
+    freshlyAnsweredRef.current = new Set()
   }
 
   async function deleteConversation(id: string, e: React.MouseEvent) {
@@ -1587,6 +1791,75 @@ export function AgentChat({ rootPath }: { rootPath?: string }) {
           </div>
         </div>
       </div>
+
+      {pendingAsk && typeof document !== "undefined" && createPortal(
+        <div className="fixed inset-0 z-[9999] flex items-end justify-center pb-8 bg-black/60">
+          <div className="bg-[#1c1c1c] border border-[#333] rounded-2xl w-full max-w-lg mx-4 shadow-2xl overflow-hidden">
+            <div className="px-5 pt-5 pb-3">
+              <p className="text-sm font-semibold text-white">{pendingAsk.question}</p>
+            </div>
+            <div className="flex flex-col gap-1 px-3 pb-3">
+              {pendingAsk.options.map((opt, i) => (
+                <button
+                  key={i}
+                  className="flex items-center gap-3 rounded-xl px-3 py-3 text-left text-sm text-[#e0e0e0] hover:bg-[#2a2a2a] transition-colors"
+                  onClick={() => { pendingAsk.resolve(opt); setPendingAsk(null) }}
+                >
+                  <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-lg bg-[#2a2a2a] text-xs font-bold text-[#888]">{i + 1}</span>
+                  {opt}
+                </button>
+              ))}
+              <div className="flex items-center gap-2 mt-1 px-1">
+                <input
+                  autoFocus={pendingAsk.options.length === 0}
+                  placeholder="Outra opção..."
+                  className="flex-1 bg-transparent text-sm text-[#e0e0e0] placeholder-[#555] outline-none border-b border-[#333] pb-1"
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && e.currentTarget.value.trim()) {
+                      pendingAsk.resolve(e.currentTarget.value.trim())
+                      setPendingAsk(null)
+                    }
+                  }}
+                />
+                <button
+                  className="text-xs text-[#666] hover:text-[#aaa] transition-colors"
+                  onClick={() => { pendingAsk.resolve("(skipped)"); setPendingAsk(null) }}
+                >
+                  Pular
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>,
+        document.body,
+      )}
+
+      {pendingDelete && typeof document !== "undefined" && createPortal(
+        <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/60">
+          <div className="bg-[#1c1c1c] border border-[#333] rounded-xl p-5 max-w-sm w-full mx-4 shadow-2xl">
+            <p className="text-sm font-semibold text-red-400 mb-1">Confirm deletion</p>
+            <p className="text-xs text-[#aaa] break-all mb-4">{pendingDelete.path}</p>
+            <div className="flex gap-2 justify-end">
+              <Button
+                variant="ghost"
+                size="sm"
+                className="text-[#aaa] hover:text-white"
+                onClick={() => { pendingDelete.resolve(false); setPendingDelete(null) }}
+              >
+                Cancel
+              </Button>
+              <Button
+                size="sm"
+                className="bg-red-600 hover:bg-red-700 text-white"
+                onClick={() => { pendingDelete.resolve(true); setPendingDelete(null) }}
+              >
+                Delete
+              </Button>
+            </div>
+          </div>
+        </div>,
+        document.body,
+      )}
     </div>
   )
 }

@@ -13,6 +13,7 @@ fn run_shell(command: String, cwd: String) -> Result<ShellOutput, String> {
         .arg("-c")
         .arg(&command)
         .current_dir(&cwd)
+        .stdin(std::process::Stdio::null())
         .output()
         .map_err(|e| e.to_string())?;
 
